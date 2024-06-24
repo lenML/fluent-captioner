@@ -1,0 +1,9 @@
+transformers
+tqdm
+# torch
+# torchvision
+# torchaudio
+gradio
+einops
+timm
+flash_attn
