@@ -6,4 +6,5 @@ tqdm
 gradio
 einops
 timm
-flash_attn
+# flash_attn
+pillow
