@@ -1,13 +1,25 @@
+import logging
 import os
-import torch
-from transformers import AutoProcessor, AutoModelForCausalLM, CLIPImageProcessor
-from PIL import Image
-import numpy as np
-from typing import Tuple, Union, Literal
+from typing import Literal, Tuple, Union
 
 # workaround for unnecessary flash_attn requirement
 from unittest.mock import patch
+
+import numpy as np
+import torch
+from PIL import Image
+from pydantic import (
+    BaseModel,
+    GetCoreSchemaHandler,
+    GetJsonSchemaHandler,
+    ValidationError,
+)
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import core_schema
+from transformers import AutoModelForCausalLM, AutoProcessor, CLIPImageProcessor
 from transformers.dynamic_module_utils import get_imports
+
+logger = logging.getLogger(__name__)
 
 
 def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
@@ -52,41 +64,23 @@ TASK_TYPES = Literal[
 ]
 
 
-class ODResult:
-    def __init__(self, bboxes: list[Tuple[int, int, int, int]], labels: list[str]):
-        self.bboxes = bboxes
-        self.labels = labels
-
-        self.objects = list(zip(self.bboxes, self.labels))
-
-    def __str__(self):
-        return str(self.objects)
+class ODResult(BaseModel):
+    bbox: list[Tuple[int, int, int, int]]
+    labels: list[str]
 
 
-class OCRRegionResult:
-    def __init__(
-        self,
-        quad_boxes: list[Tuple[int, int, int, int, int, int, int, int]],
-        labels: list[str],
-    ):
-        self.quad_boxes = quad_boxes
-        self.labels = labels
-
-        self.objects = list(zip(self.quad_boxes, self.labels))
-
-    def __str__(self):
-        return str(self.objects)
+class OCRRegionResult(BaseModel):
+    quad_boxes: list[Tuple[int, int, int, int, int, int, int, int]]
+    labels: list[str]
 
 
-class SEGResult:
-    def __init__(self, polygons: list[list[list[int]]], labels: list[str]):
-        self.polygons = polygons
-        self.labels = labels
+class SEGResult(BaseModel):
+    polygons: list[list[list[int]]]
+    labels: list[str]
 
-        self.objects = list(zip(self.polygons, self.labels))
 
-    def __str__(self):
-        return str(self.objects)
+class TextResult(BaseModel):
+    text: str
 
 
 class Florence2Model:
@@ -102,30 +96,42 @@ class Florence2Model:
         assert max_new_tokens > 0, "max_new_tokens should be greater than 0"
         assert num_beams > 0, "num_beams should be greater than 0"
 
+        self.model_id = model_id
         self.device = device
         self.dtype = dtype
         self.max_new_tokens = max_new_tokens
         self.num_beams = num_beams
+
+        self.model = None
+        self.processor: CLIPImageProcessor = None
+
+    def load_model(self):
+        if self.model:
+            return
+
+        logger.info(f"Loading model: {self.model_id}")
 
         with patch(
             "transformers.dynamic_module_utils.get_imports", fixed_get_imports
         ):  # workaround for unnecessary flash_attn requirement
             self.model = (
                 AutoModelForCausalLM.from_pretrained(
-                    model_id,
+                    self.model_id,
                     cache_dir="./models",
                     trust_remote_code=True,
                     local_files_only=True,
                 )
-                .to(device=self.device, dtype=dtype)
+                .to(device=self.device, dtype=self.dtype)
                 .eval()
             )
             self.processor: CLIPImageProcessor = AutoProcessor.from_pretrained(
-                model_id,
+                self.model_id,
                 cache_dir="./models",
                 trust_remote_code=True,
                 local_files_only=True,
             )
+
+        logger.info(f"Model loaded: {self.model_id}")
 
     def process_image(
         self,
@@ -144,6 +150,8 @@ class Florence2Model:
     def run_model(
         self, task_prompt: str, image: Image.Image, text_input: Union[str, None] = None
     ) -> str:
+        assert self.model, "Model is not loaded"
+
         if text_input is not None:
             prompt = task_prompt + text_input
         else:
@@ -184,7 +192,17 @@ class Florence2Model:
             image=image, task_type=task_type, text_input=text_input
         )
         result = parsed_answer[list(parsed_answer.keys())[0]]
-        return result
+        if isinstance(result, str):
+            return TextResult(text=result)
+        if "bboxes" in result:
+            return ODResult(bboxes=result["bboxes"], labels=result["labels"])
+        if "quad_boxes" in result:
+            return OCRRegionResult(
+                quad_boxes=result["quad_boxes"], labels=result["labels"]
+            )
+        if "polygons" in result:
+            return SEGResult(polygons=result["polygons"], labels=result["labels"])
+        raise ValueError(f"Invalid result format: {result}")
 
     def run_caption_task(
         self,
@@ -192,98 +210,89 @@ class Florence2Model:
         task_type: Literal[
             "Caption", "Detailed Caption", "More Detailed Caption"
         ] = "More Detailed Caption",
-    ) -> str:
+    ) -> TextResult:
         return self.run_task(image, task_type)
 
     def run_ocr_task(
         self,
         image: np.ndarray,
-    ) -> str:
+    ) -> TextResult:
         return self.run_task(image, task_type="OCR")
 
     def run_region_ocr_task(
         self,
         image: np.ndarray,
     ) -> OCRRegionResult:
-        result = self.run_task(image, task_type="OCR with Region")
-        return OCRRegionResult(quad_boxes=result["quad_boxes"], labels=result["labels"])
+        return self.run_task(image, task_type="OCR with Region")
 
     def run_od_task(
         self,
         image: np.ndarray,
     ) -> ODResult:
-        result = self.run_task(image, task_type="Object Detection")
-        return ODResult(bboxes=result["bboxes"], labels=result["labels"])
+        return self.run_task(image, task_type="Object Detection")
 
     def run_open_od_task(
         self,
         image: np.ndarray,
         prompt: str,
     ) -> ODResult:
-        result = self.run_task(
+        return self.run_task(
             image, task_type="Open Vocabulary Detection", text_input=prompt
         )
-        return ODResult(bboxes=result["bboxes"], labels=result["labels"])
 
     def run_region_caption_task(
         self,
         image: np.ndarray,
     ) -> ODResult:
-        result = self.run_task(image, task_type="Dense Region Caption")
-        return ODResult(bboxes=result["bboxes"], labels=result["labels"])
+        return self.run_task(image, task_type="Dense Region Caption")
 
     def run_region_proposal_task(
         self,
         image: np.ndarray,
     ) -> ODResult:
-        result = self.run_task(image, task_type="Region Proposal")
-        return ODResult(bboxes=result["bboxes"], labels=result["labels"])
+        return self.run_task(image, task_type="Region Proposal")
 
     def run_grounding_task(
         self,
         image: np.ndarray,
         caption: str,
     ) -> ODResult:
-        result = self.run_task(
+        return self.run_task(
             image, task_type="Caption to Phrase Grounding", text_input=caption
         )
-        return ODResult(bboxes=result["bboxes"], labels=result["labels"])
 
     def run_segmentation_task(
         self,
         image: np.ndarray,
         ref_prompt: str,
     ) -> SEGResult:
-        result = self.run_task(
+        return self.run_task(
             image, task_type="Referring Expression Segmentation", text_input=ref_prompt
         )
-        return SEGResult(polygons=result["polygons"], labels=result["labels"])
 
     def run_region_segmentation_task(
         self,
         image: np.ndarray,
         regin_prompt: str,
     ) -> SEGResult:
-        result = self.run_task(
+        return self.run_task(
             image, task_type="Region to Segmentation", text_input=regin_prompt
         )
-        return SEGResult(polygons=result["polygons"], labels=result["labels"])
 
     def run_region_category_task(
         self,
         image: np.ndarray,
         region_prompt: str,
     ) -> ODResult:
-        result = self.run_task(
+        return self.run_task(
             image, task_type="Region to Category", text_input=region_prompt
         )
-        return ODResult(bboxes=result["bboxes"], labels=result["labels"])
 
     def run_region_description_task(
         self,
         image: np.ndarray,
         region_prompt: str,
-    ) -> str:
+    ) -> TextResult:
         return self.run_task(
             image, task_type="Region to Description", text_input=region_prompt
         )
@@ -292,6 +301,7 @@ class Florence2Model:
 if __name__ == "__main__":
     # model = Florence2Model(dtype=torch.float32)
     model = Florence2Model()
+    model.load_model()
     # image = np.array(Image.open("./test.png"))
     image = Image.open("./test_ocr.png")
     image = image.convert("RGB")

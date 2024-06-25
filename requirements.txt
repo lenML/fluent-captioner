@@ -8,3 +8,7 @@ einops
 timm
 # flash_attn
 pillow
+fastapi
+uvicorn
+fastapi-jsonrpc
+cachetools
