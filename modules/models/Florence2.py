@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Literal, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 # workaround for unnecessary flash_attn requirement
 from unittest.mock import patch
@@ -16,8 +16,15 @@ from pydantic import (
 )
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import core_schema
-from transformers import AutoModelForCausalLM, AutoProcessor, CLIPImageProcessor
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    ProcessorMixin,
+    CLIPImageProcessor,
+    BertTokenizer,
+)
 from transformers.dynamic_module_utils import get_imports
+from torchvision import transforms
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +110,10 @@ class Florence2Model:
         self.num_beams = num_beams
 
         self.model = None
-        self.processor: CLIPImageProcessor = None
+        self.processor: ProcessorMixin = None
+
+        self.image_processor: CLIPImageProcessor = None
+        self.tokenizer: BertTokenizer = None
 
     def load_model(self):
         if self.model:
@@ -124,12 +134,15 @@ class Florence2Model:
                 .to(device=self.device, dtype=self.dtype)
                 .eval()
             )
-            self.processor: CLIPImageProcessor = AutoProcessor.from_pretrained(
+            self.processor: ProcessorMixin = AutoProcessor.from_pretrained(
                 self.model_id,
                 cache_dir="./models",
                 trust_remote_code=True,
                 local_files_only=True,
             )
+
+            self.image_processor = self.processor.image_processor
+            self.tokenizer = self.processor.tokenizer
 
         logger.info(f"Model loaded: {self.model_id}")
 
@@ -147,6 +160,8 @@ class Florence2Model:
         parsed_answer = self.run_model(task_prompt, image, text_input)
         return parsed_answer
 
+    @torch.no_grad()
+    @torch.inference_mode()
     def run_model(
         self, task_prompt: str, image: Image.Image, text_input: Union[str, None] = None
     ) -> str:
@@ -297,6 +312,20 @@ class Florence2Model:
             image, task_type="Region to Description", text_input=region_prompt
         )
 
+    def get_text_embeddings(self, text: Optional[str]) -> torch.Tensor:
+        input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"].to(
+            device=self.device
+        )
+        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+        return inputs_embeds
+
+    def get_image_embeddings(self, image: np.ndarray) -> torch.Tensor:
+        pixel_values = self.image_processor(images=image, return_tensors="pt")[
+            "pixel_values"
+        ].to(device=self.device, dtype=self.dtype)
+        image_features = self.model._encode_image(pixel_values)
+        return image_features
+
 
 if __name__ == "__main__":
     # model = Florence2Model(dtype=torch.float32)
@@ -307,6 +336,9 @@ if __name__ == "__main__":
     image = image.convert("RGB")
     image_data = np.array(image)
     # result = model.process_image(image, task_type="Region Proposal")
-    result = model.run_region_category_task(image_data, "logo")
+    # result = model.run_region_category_task(image_data, "logo")
+    result = model.get_image_embeddings(image=image)
+    # result = model.get_text_embeddung("hello world")
     print("== OUTPUT ==")
+    print(result.shape)
     print(result)
